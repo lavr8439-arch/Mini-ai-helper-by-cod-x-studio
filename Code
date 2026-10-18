@@ -1,0 +1,282 @@
+# Mini AI launcher for Windows. Uses only Python's standard library.
+import os
+import re
+import sys
+import json
+import glob
+import random
+import subprocess
+import tkinter as tk
+from tkinter import ttk
+from pathlib import Path
+
+ALIASES = {
+    'tg': 'telegram', 'ayu gram': 'telegram', 'ayugram': 'telegram',
+    'web browser': 'edge', 'vs code': 'visual studio code', 'vscode': 'visual studio code',
+    'file manager': 'file explorer', 'task mgr': 'task manager',
+}
+STOPWORDS = ('can you', 'could you', 'would you', 'please', 'open', 'launch', 'start', 'run', 'play')
+
+def clean(text):
+    text = text.strip().lower()
+    for word in STOPWORDS:
+        text = re.sub(r'(^|\s)' + re.escape(word) + r'(?=\s|$)', ' ', text)
+    text = re.sub(r'[.!?,]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return ALIASES.get(text, text)
+
+def shortcut_paths():
+    roots = [
+        Path(os.environ.get('APPDATA', '')) / 'Microsoft/Windows/Start Menu/Programs',
+        Path(os.environ.get('PROGRAMDATA', '')) / 'Microsoft/Windows/Start Menu/Programs',
+        Path(os.path.expanduser('~/Desktop')),
+        Path(os.environ.get('PUBLIC', 'C:/Users/Public')) / 'Desktop',
+    ]
+    found = []
+    for root in roots:
+        if root.exists():
+            found.extend(root.rglob('*.lnk'))
+    return found
+
+def installed_names():
+    names = {p.stem for p in shortcut_paths()}
+    try:
+        import winreg
+        roots = [(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Uninstall'),
+                 (winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\Uninstall'),
+                 (winreg.HKEY_LOCAL_MACHINE, r'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')]
+        for hive, base in roots:
+            try:
+                with winreg.OpenKey(hive, base) as key:
+                    for i in range(winreg.QueryInfoKey(key)[0]):
+                        try:
+                            sub = winreg.EnumKey(key, i)
+                            with winreg.OpenKey(key, sub) as app:
+                                name, _ = winreg.QueryValueEx(app, 'DisplayName')
+                                if name: names.add(name)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    except ImportError:
+        pass
+    names.update(g['name'] for g in game_entries())
+    return sorted(names, key=str.casefold)
+
+def game_entries():
+    games = []
+    steam_roots = [os.path.expandvars(r'%ProgramFiles(x86)%\Steam'), os.path.expandvars(r'%ProgramFiles%\Steam')]
+    for root in steam_roots:
+        for manifest in glob.glob(os.path.join(root, 'steamapps', 'appmanifest_*.acf')):
+            try:
+                raw = Path(manifest).read_text(errors='ignore')
+                name = re.search(r'"name"\s+"([^"]+)"', raw)
+                appid = re.search(r'appmanifest_(\d+)', os.path.basename(manifest))
+                if name and appid: games.append({'name': name.group(1), 'uri': f"steam://rungameid/{appid.group(1)}"})
+            except OSError:
+                pass
+    epic = Path(os.environ.get('PROGRAMDATA', 'C:/ProgramData')) / 'Epic/EpicGamesLauncher/Data/Manifests'
+    if epic.exists():
+        for manifest in epic.glob('*.item'):
+            try:
+                item = json.loads(manifest.read_text(encoding='utf-8'))
+                if item.get('DisplayName') and item.get('AppName'):
+                    games.append({'name': item['DisplayName'], 'uri': f"com.epicgames.launcher://apps/{item['AppName']}?action=launch&silent=true"})
+            except (OSError, ValueError):
+                pass
+    return games
+
+def open_telegram_web_random_profile():
+    local = Path(os.environ.get('LOCALAPPDATA', ''))
+    browsers = [
+        ('Chrome', local / 'Google/Chrome/User Data', [
+            Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)')) / 'Google/Chrome/Application/chrome.exe',
+            Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / 'Google/Chrome/Application/chrome.exe',
+            local / 'Google/Chrome/Application/chrome.exe']),
+        ('Edge', local / 'Microsoft/Edge/User Data', [
+            Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)')) / 'Microsoft/Edge/Application/msedge.exe',
+            Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / 'Microsoft/Edge/Application/msedge.exe']),
+    ]
+    for browser_name, profile_root, exe_paths in browsers:
+        exe = next((p for p in exe_paths if p.is_file()), None)
+        if not exe or not profile_root.is_dir():
+            continue
+        profiles = [p.name for p in profile_root.iterdir() if p.is_dir() and
+                    (p.name == 'Default' or p.name.startswith('Profile ')) and (p / 'Preferences').is_file()]
+        if profiles:
+            profile = random.SystemRandom().choice(profiles)
+            subprocess.Popen([str(exe), '--new-window', f'--profile-directory={profile}', 'https://web.telegram.org'])
+            return f'Opening Telegram Web in a random {browser_name} profile: {profile}.'
+    os.startfile('https://web.telegram.org')
+    return 'No Chrome or Edge profiles found. Opened Telegram Web in the default browser.'
+
+def launch(query):
+    query = clean(query)
+    if not query:
+        return False, 'Type an app or game name.', []
+    if query in ('list', 'apps', 'applications', 'games'):
+        return False, '\n'.join(installed_names()) or 'No apps found.', []
+    if query == 'telegram':
+        for p in shortcut_paths():
+            if any(name in p.stem.lower() for name in ('ayugram', 'ayu gram', 'telegram')):
+                os.startfile(str(p)); return True, f'Opening {p.stem}', []
+        # Look up the AyuGram executable from installed-app registry entries.
+        try:
+            import winreg
+            roots = [(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Uninstall'),
+                     (winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\Uninstall'),
+                     (winreg.HKEY_LOCAL_MACHINE, r'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')]
+            for hive, base in roots:
+                try:
+                    with winreg.OpenKey(hive, base) as key:
+                        for i in range(winreg.QueryInfoKey(key)[0]):
+                            try:
+                                with winreg.OpenKey(key, winreg.EnumKey(key, i)) as app:
+                                    vals = dict(winreg.EnumValue(app, j)[:2] for j in range(winreg.QueryInfoKey(app)[1]))
+                                    if 'ayugram' in str(vals.get('DisplayName', '')).lower():
+                                        icon = str(vals.get('DisplayIcon', '')).strip().strip('"')
+                                        icon = re.sub(r',\s*-?\d+$', '', icon).strip('"')
+                                        if icon.lower().endswith('.exe') and os.path.isfile(icon):
+                                            os.startfile(icon); return True, 'Opening AyuGram', []
+                                        location = vals.get('InstallLocation', '')
+                                        exe = os.path.join(location, 'AyuGram.exe')
+                                        if os.path.isfile(exe):
+                                            os.startfile(exe); return True, 'Opening AyuGram', []
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+        return True, 'AyuGram not found. ' + open_telegram_web_random_profile(), []
+    shortcuts = shortcut_paths()
+    exact = [p for p in shortcuts if p.stem.casefold() == query.casefold()]
+    partial = [p for p in shortcuts if query.casefold() in p.stem.casefold()]
+    shortcut_matches = exact or partial
+    candidates = []
+    seen = set()
+    for p in shortcut_matches:
+        key = str(p.resolve()).casefold()
+        if key not in seen:
+            seen.add(key)
+            candidates.append({'name': p.stem, 'detail': str(p.parent), 'target': str(p), 'kind': 'shortcut'})
+    games = game_entries()
+    matching_games = [g for g in games if g['name'].casefold() == query.casefold()]
+    if not matching_games:
+        matching_games = [g for g in games if query.casefold() in g['name'].casefold()]
+    for game in matching_games:
+        key = game['uri'].casefold()
+        if key not in seen:
+            seen.add(key)
+            candidates.append({'name': game['name'], 'detail': 'Game · Steam / Epic Games', 'target': game['uri'], 'kind': 'game'})
+    if len(candidates) == 1:
+        item = candidates[0]
+        os.startfile(item['target'])
+        return True, f"Opening {item['name']}", []
+    if len(candidates) > 1:
+        return False, 'Several matches found. Choose the one you want.', candidates
+    # Built-in apps also work when their shortcuts are absent.
+    builtins = {'calculator': 'calc.exe', 'notepad': 'notepad.exe', 'file explorer': 'explorer.exe',
+                'task manager': 'taskmgr.exe', 'settings': 'ms-settings:', 'terminal': 'wt.exe'}
+    if query in builtins:
+        try: os.startfile(builtins[query]); return True, f'Opening {query}', []
+        except OSError: pass
+    return False, f'Could not find “{query}”. Try choosing it from the app list.', []
+
+class Assistant:
+    def __init__(self, root):
+        self.root = root
+        root.title('Mini AI Launcher')
+        root.geometry('650x520')
+        root.minsize(560, 460)
+        root.overrideredirect(True)
+        root.configure(bg='#0d1220')
+        self.colors = {'bg': '#0d1220', 'panel': '#171f32', 'field': '#202a40', 'muted': '#9aa8bf', 'white': '#f4f7ff', 'blue': '#6685ff', 'green': '#78dfb0'}
+        self.drag_offset = (0, 0)
+        titlebar = tk.Frame(root, bg='#111827', height=38); titlebar.pack(fill='x'); titlebar.pack_propagate(False)
+        tk.Label(titlebar, text='✦', font=('Segoe UI', 12, 'bold'), fg=self.colors['blue'], bg='#111827').pack(side='left', padx=(13, 7))
+        title = tk.Label(titlebar, text='MINI AI  /  APP LAUNCHER', font=('Segoe UI', 9, 'bold'), fg='#c7d2e5', bg='#111827')
+        title.pack(side='left')
+        close = tk.Button(titlebar, text='×', command=root.destroy, font=('Segoe UI', 16), bg='#111827', activebackground='#e55261', fg='#aab6cb', activeforeground='white', relief='flat', width=4, cursor='hand2', bd=0)
+        close.pack(side='right', fill='y')
+        for widget in (titlebar, title):
+            widget.bind('<Button-1>', self.start_drag)
+            widget.bind('<B1-Motion>', self.drag_window)
+        root.bind('<Escape>', lambda _e: root.destroy())
+        shell = tk.Frame(root, bg=self.colors['bg']); shell.pack(fill='both', expand=True, padx=28, pady=22)
+        tk.Label(shell, text='✦  MINI LAUNCHER', font=('Segoe UI', 10, 'bold'), fg=self.colors['blue'], bg=self.colors['bg']).pack(anchor='w')
+        tk.Label(shell, text='What would you like to open?', font=('Segoe UI', 23, 'bold'), fg=self.colors['white'], bg=self.colors['bg']).pack(anchor='w', pady=(5, 2))
+        tk.Label(shell, text='Type a command and I’ll find the app or game for you.', font=('Segoe UI', 10), fg=self.colors['muted'], bg=self.colors['bg']).pack(anchor='w', pady=(0, 20))
+        card = tk.Frame(shell, bg=self.colors['panel'], padx=18, pady=18); card.pack(fill='x')
+        tk.Label(card, text='COMMAND', font=('Segoe UI', 9, 'bold'), fg=self.colors['muted'], bg=self.colors['panel']).pack(anchor='w', pady=(0, 9))
+        self.entry = tk.Entry(card, font=('Segoe UI', 14), bg=self.colors['field'], fg=self.colors['white'], insertbackground='white', relief='flat', highlightthickness=1, highlightbackground='#34415c', highlightcolor=self.colors['blue'])
+        self.entry.pack(fill='x', ipady=11)
+        self.entry.insert(0, 'open Telegram')
+        self.entry.bind('<FocusIn>', self.clear_hint)
+        self.entry.bind('<Return>', lambda _e: self.run())
+        row = tk.Frame(card, bg=self.colors['panel']); row.pack(fill='x', pady=(14, 0))
+        tk.Button(row, text='  Open  →', command=self.run, font=('Segoe UI', 10, 'bold'), bg=self.colors['blue'], activebackground='#7892ff', fg='white', activeforeground='white', relief='flat', padx=16, pady=10, cursor='hand2').pack(side='left')
+        tk.Button(row, text='All apps', command=self.show_list, font=('Segoe UI', 10), bg='#2a3550', activebackground='#374664', fg=self.colors['white'], activeforeground='white', relief='flat', padx=14, pady=10, cursor='hand2').pack(side='left', padx=9)
+        tk.Label(shell, text='QUICK LAUNCH', font=('Segoe UI', 9, 'bold'), fg=self.colors['muted'], bg=self.colors['bg']).pack(anchor='w', pady=(20, 9))
+        quick = tk.Frame(shell, bg=self.colors['bg']); quick.pack(anchor='w')
+        for title, command in [('✈  Telegram', 'open Telegram'), ('◉  Discord', 'open Discord'), ('🎮  Minecraft', 'open Minecraft')]:
+            tk.Button(quick, text=title, command=lambda c=command: self.quick(c), font=('Segoe UI', 9), bg=self.colors['panel'], activebackground='#26334b', fg=self.colors['white'], activeforeground='white', relief='flat', padx=11, pady=9, cursor='hand2').pack(side='left', padx=(0, 8))
+        self.status = tk.Label(shell, text='Ready when you are.', font=('Segoe UI', 10), fg=self.colors['green'], bg=self.colors['bg'], wraplength=560, justify='left', anchor='w')
+        self.status.pack(fill='x', pady=(22, 0))
+        tk.Label(shell, text='Finds apps and games installed on this PC', font=('Segoe UI', 9), fg='#6e7d97', bg=self.colors['bg']).pack(side='bottom', anchor='w', pady=(10, 0))
+        self.entry.focus_set()
+    def clear_hint(self, _event=None):
+        if self.entry.get() == 'open Telegram': self.entry.delete(0, 'end')
+    def start_drag(self, event):
+        self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
+    def drag_window(self, event):
+        x, y = self.drag_offset
+        self.root.geometry(f'+{event.x_root - x}+{event.y_root - y}')
+    def quick(self, command):
+        self.entry.delete(0, 'end'); self.entry.insert(0, command); self.run()
+    def run(self):
+        ok, msg, options = launch(self.entry.get())
+        self.status.config(text=msg, fg=self.colors['green'] if ok else '#ffcc70')
+        if options: self.choose(options)
+    def choose(self, options):
+        win = tk.Toplevel(self.root); win.title('Choose an app'); win.geometry('540x440'); win.configure(bg=self.colors['bg']); win.transient(self.root); win.grab_set()
+        body = tk.Frame(win, bg=self.colors['bg'], padx=20, pady=18); body.pack(fill='both', expand=True)
+        tk.Label(body, text='Multiple matches found', font=('Segoe UI', 17, 'bold'), fg=self.colors['white'], bg=self.colors['bg']).pack(anchor='w')
+        tk.Label(body, text='Choose the app or game you want to open:', font=('Segoe UI', 10), fg=self.colors['muted'], bg=self.colors['bg']).pack(anchor='w', pady=(3, 12))
+        list_frame = tk.Frame(body, bg=self.colors['bg']); list_frame.pack(fill='both', expand=True)
+        box = tk.Listbox(list_frame, font=('Segoe UI', 10), bg=self.colors['panel'], fg=self.colors['white'], selectbackground=self.colors['blue'], selectforeground='white', relief='flat', highlightthickness=0, activestyle='none')
+        scroll = ttk.Scrollbar(list_frame, orient='vertical', command=box.yview); box.configure(yscrollcommand=scroll.set)
+        box.pack(side='left', fill='both', expand=True); scroll.pack(side='right', fill='y')
+        for item in options: box.insert('end', f"  {item['name']}   ·   {item['detail']}")
+        def open_choice(_event=None):
+            selected = box.curselection()
+            if not selected: return
+            item = options[selected[0]]
+            os.startfile(item['target'])
+            self.status.config(text=f"Opening {item['name']}", fg=self.colors['green'])
+            win.destroy()
+        box.bind('<Double-Button-1>', open_choice)
+        buttons = tk.Frame(body, bg=self.colors['bg']); buttons.pack(fill='x', pady=(12, 0))
+        tk.Button(buttons, text='Open selected', command=open_choice, bg=self.colors['blue'], fg='white', relief='flat', padx=15, pady=9, cursor='hand2').pack(side='left')
+        tk.Button(buttons, text='Cancel', command=win.destroy, bg='#2a3550', fg=self.colors['white'], relief='flat', padx=15, pady=9, cursor='hand2').pack(side='right')
+        if options: box.selection_set(0)
+    def show_list(self):
+        names = installed_names()
+        win = tk.Toplevel(self.root); win.title('Apps and games'); win.geometry('470x500'); win.configure(bg=self.colors['bg'])
+        tk.Label(win, text='Apps and games', font=('Segoe UI', 16, 'bold'), fg=self.colors['white'], bg=self.colors['bg']).pack(anchor='w', padx=14, pady=(14, 6))
+        box = tk.Listbox(win, font=('Segoe UI', 10), bg=self.colors['panel'], fg=self.colors['white'], selectbackground=self.colors['blue'], relief='flat', highlightthickness=0)
+        box.pack(fill='both', expand=True, padx=12, pady=12)
+        for name in names: box.insert('end', name)
+        box.bind('<Double-Button-1>', lambda _e: self.use_selected(box))
+    def use_selected(self, box):
+        selection = box.curselection()
+        if selection:
+            self.entry.delete(0, 'end'); self.entry.insert(0, box.get(selection[0])); self.run()
+
+if __name__ == '__main__':
+    if os.name != 'nt':
+        print('This mini assistant is designed for Windows.')
+        sys.exit(1)
+    root = tk.Tk()
+    Assistant(root)
+    root.mainloop()
